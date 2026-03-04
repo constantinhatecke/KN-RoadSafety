@@ -1,17 +1,16 @@
 """
-API Client — Road Logistics Weather Risk Pipeline
----------------------------------------------------
-Fetches live weather data from Open-Meteo (free, no API key)
-and country metadata from REST Countries API.
+API Client — Road Logistics Weather Risk Pipeline v5
+-----------------------------------------------------
+Fetches live + forecast weather from Open-Meteo and
+reverse-geocodes waypoint coordinates to town names.
 
-v2 — adds waypoint sampling along corridors:
-  - Regular interval waypoints based on corridor distance
-  - Hardcoded high-risk geographic areas (mountain passes etc.)
-  - Batch weather fetching for all waypoints per corridor
+New in v5:
+  - fetch_waypoint_weather() now returns current + hourly forecast
+  - reverse_geocode() resolves (lat, lng) -> nearest town name
+  - Waypoints labeled "WP2 — Cologne" format
 """
 
 import time
-import math
 import logging
 import requests
 from typing import Optional
@@ -19,12 +18,16 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 WEATHER_BASE_URL   = "https://api.open-meteo.com/v1/forecast"
+GEOCODE_URL        = "https://nominatim.openstreetmap.org/reverse"
 COUNTRIES_BASE_URL = "https://restcountries.com/v3.1"
-MAX_RETRIES    = 3
-RETRY_BACKOFF  = 2
+MAX_RETRIES   = 3
+RETRY_BACKOFF = 2
+
+# Forecast hours we care about — what matters operationally
+FORECAST_HOURS = [6, 12, 24]
 
 
-# ── Major K+N Road Logistics Hubs ────────────────────────────────────────────
+# ── Logistics network definitions ─────────────────────────────────────────────
 LOGISTICS_HUBS = [
     {"id": "HAM", "name": "Hamburg",   "country": "DE", "lat": 53.5511, "lng":  9.9937},
     {"id": "RTD", "name": "Rotterdam", "country": "NL", "lat": 51.9244, "lng":  4.4777},
@@ -40,7 +43,6 @@ LOGISTICS_HUBS = [
     {"id": "MUC", "name": "Munich",    "country": "DE", "lat": 48.1351, "lng": 11.5820},
 ]
 
-# ── Key Road Corridors ────────────────────────────────────────────────────────
 ROAD_CORRIDORS = [
     {"id": "HAM-RTD", "origin": "HAM", "destination": "RTD", "distance_km":  385},
     {"id": "HAM-MUC", "origin": "HAM", "destination": "MUC", "distance_km":  778},
@@ -56,166 +58,23 @@ ROAD_CORRIDORS = [
     {"id": "BUD-BUC", "origin": "BUD", "destination": "BUC", "distance_km":  812},
 ]
 
-# ── High-Risk Geographic Areas ────────────────────────────────────────────────
-# Known weather hotspots for European road freight.
-# Each entry defines which corridors it applies to based on proximity.
-# In production these would come from a geospatial database.
 HIGH_RISK_AREAS = [
-    {
-        "id":          "BRENNER",
-        "name":        "Brenner Pass",
-        "lat":         47.0167,
-        "lng":         11.5000,
-        "elevation_m": 1374,
-        "risk_note":   "Critical Alpine crossing — closes in heavy snow",
-        "applies_to":  ["MUC-MIL"],          # lies on this corridor
-    },
-    {
-        "id":          "PYRENEES",
-        "name":        "Pyrenees (Col du Somport)",
-        "lat":         42.7897,
-        "lng":         -0.5314,
-        "elevation_m": 1632,
-        "risk_note":   "Only land route FR→ES — prone to closure Oct–Apr",
-        "applies_to":  ["PAR-MAD", "MIL-MAD"],
-    },
-    {
-        "id":          "TAUERN",
-        "name":        "Tauern Pass",
-        "lat":         47.1833,
-        "lng":         13.2000,
-        "elevation_m": 1739,
-        "risk_note":   "Major AT transit route — tunnel often congested in storms",
-        "applies_to":  ["MUC-VIE", "VIE-BUC"],
-    },
-    {
-        "id":          "CARPATHIANS",
-        "name":        "Carpathian Pass (Dukla)",
-        "lat":         49.4167,
-        "lng":         21.6833,
-        "elevation_m": 502,
-        "risk_note":   "Key Eastern Europe freight crossing — ice risk Oct–Mar",
-        "applies_to":  ["WAW-BUD"],
-    },
-    {
-        "id":          "TRANSFAGARASAN",
-        "name":        "Transylvanian Alps",
-        "lat":         45.6000,
-        "lng":         24.5500,
-        "elevation_m": 900,
-        "risk_note":   "Extreme winter conditions — RO mountain section",
-        "applies_to":  ["VIE-BUC", "BUD-BUC"],
-    },
-    {
-        "id":          "RHINE_VALLEY",
-        "name":        "Rhine Valley (Loreley)",
-        "lat":         50.1333,
-        "lng":         7.7167,
-        "elevation_m": 100,
-        "risk_note":   "Heavy fog corridor — major DE freight artery",
-        "applies_to":  ["HAM-MUC", "RTD-PAR"],
-    },
+    {"id": "BRENNER",       "name": "Brenner Pass",              "lat": 47.0167, "lng": 11.5000, "elevation_m": 1374, "risk_note": "Critical Alpine crossing — closes in heavy snow",         "applies_to": ["MUC-MIL"]},
+    {"id": "PYRENEES",      "name": "Pyrenees (Col du Somport)", "lat": 42.7897, "lng": -0.5314, "elevation_m": 1632, "risk_note": "Only land route FR to ES — prone to closure Oct–Apr",    "applies_to": ["PAR-MAD", "MIL-MAD"]},
+    {"id": "TAUERN",        "name": "Tauern Pass",               "lat": 47.1833, "lng": 13.2000, "elevation_m": 1739, "risk_note": "Major AT transit route — tunnel congested in storms",     "applies_to": ["MUC-VIE", "VIE-BUC"]},
+    {"id": "CARPATHIANS",   "name": "Carpathian Pass (Dukla)",   "lat": 49.4167, "lng": 21.6833, "elevation_m":  502, "risk_note": "Key Eastern Europe freight crossing — ice risk Oct–Mar",  "applies_to": ["WAW-BUD"]},
+    {"id": "TRANSFAGARASAN","name": "Transylvanian Alps",        "lat": 45.6000, "lng": 24.5500, "elevation_m":  900, "risk_note": "Extreme winter conditions — RO mountain section",          "applies_to": ["VIE-BUC", "BUD-BUC"]},
+    {"id": "RHINE_VALLEY",  "name": "Rhine Valley (Loreley)",    "lat": 50.1333, "lng":  7.7167, "elevation_m":  100, "risk_note": "Heavy fog corridor — major DE freight artery",             "applies_to": ["HAM-MUC", "RTD-PAR"]},
 ]
 
 
-# ── Waypoint Generation ───────────────────────────────────────────────────────
-
-def _interpolate_waypoints(
-    origin_lat: float, origin_lng: float,
-    dest_lat: float,   dest_lng: float,
-    n_points: int
-) -> list[dict]:
-    """
-    Generates evenly spaced waypoints along a straight line between
-    two coordinates using linear interpolation.
-
-    Note: For short European corridors (<2000km) linear interpolation
-    is accurate enough. For longer routes you'd use great-circle
-    interpolation to account for Earth's curvature.
-
-    Returns list of {lat, lng} dicts NOT including the endpoints
-    (endpoints are already checked as hub weather).
-    """
-    waypoints = []
-    for i in range(1, n_points + 1):
-        fraction = i / (n_points + 1)
-        lat = origin_lat + (dest_lat - origin_lat) * fraction
-        lng = origin_lng + (dest_lng - origin_lng) * fraction
-        waypoints.append({"lat": round(lat, 4), "lng": round(lng, 4)})
-    return waypoints
-
-
-def _n_interval_waypoints(distance_km: int) -> int:
-    """
-    Determines how many interval waypoints to sample based on
-    corridor distance. Longer corridors need more samples to
-    avoid missing localised weather events.
-    """
-    if distance_km < 400:
-        return 2   # short:  check midpoint + 1 extra
-    elif distance_km < 700:
-        return 3   # medium: 3 interval points
-    elif distance_km < 1200:
-        return 5   # long:   5 interval points
-    else:
-        return 7   # very long (e.g. MIL-MAD at 1858km): 7 points
-
-
-def get_corridor_waypoints(corridor: dict) -> list[dict]:
-    """
-    Returns the full list of waypoints to check for a corridor,
-    combining regular interval points with known high-risk areas.
-
-    Each waypoint has:
-      lat, lng, type ("interval" | "high_risk"), name, risk_note
-    """
-    hub_lookup  = {h["id"]: h for h in LOGISTICS_HUBS}
-    origin      = hub_lookup[corridor["origin"]]
-    destination = hub_lookup[corridor["destination"]]
-    distance    = corridor["distance_km"]
-    n_points    = _n_interval_waypoints(distance)
-
-    # Regular interval waypoints
-    interval_coords = _interpolate_waypoints(
-        origin["lat"], origin["lng"],
-        destination["lat"], destination["lng"],
-        n_points
-    )
-    waypoints = [
-        {**pt, "type": "interval", "name": f"Waypoint {i+1}", "risk_note": None}
-        for i, pt in enumerate(interval_coords)
-    ]
-
-    # High-risk area waypoints — only add if they apply to this corridor
-    for area in HIGH_RISK_AREAS:
-        if corridor["id"] in area["applies_to"]:
-            waypoints.append({
-                "lat":       area["lat"],
-                "lng":       area["lng"],
-                "type":      "high_risk",
-                "name":      area["name"],
-                "risk_note": area["risk_note"],
-            })
-
-    logger.info(
-        f"  {corridor['id']}: {len(interval_coords)} interval + "
-        f"{sum(1 for w in waypoints if w['type']=='high_risk')} high-risk waypoints"
-    )
-    return waypoints
-
-
-# ── Weather Fetching ──────────────────────────────────────────────────────────
-
-def _request_with_retry(url: str, params: Optional[dict] = None) -> dict:
-    """GET request with exponential backoff retry logic."""
+# ── HTTP ──────────────────────────────────────────────────────────────────────
+def _request_with_retry(url: str, params: Optional[dict] = None, headers: Optional[dict] = None) -> dict:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            logger.info(f"[Attempt {attempt}] GET {url}")
-            response = requests.get(url, params=params, timeout=10)
+            response = requests.get(url, params=params, headers=headers, timeout=10)
             if response.status_code == 429:
-                wait = RETRY_BACKOFF ** attempt
-                logger.warning(f"Rate limited — waiting {wait}s")
-                time.sleep(wait)
+                time.sleep(RETRY_BACKOFF ** attempt)
                 continue
             response.raise_for_status()
             return response.json()
@@ -230,8 +89,50 @@ def _request_with_retry(url: str, params: Optional[dict] = None) -> dict:
     raise RuntimeError(f"All {MAX_RETRIES} retries failed for {url}")
 
 
+# ── Reverse geocoding ─────────────────────────────────────────────────────────
+def reverse_geocode(lat: float, lng: float) -> str:
+    """
+    Resolves a coordinate to a human-readable town/city name.
+    Uses Nominatim (OpenStreetMap) — free, no API key required.
+    Returns the town/village/city name, falling back to county or country.
+
+    Rate limit: 1 request/second per Nominatim policy.
+    We sleep 1.1s between calls in the waypoint loop.
+    """
+    try:
+        headers = {"User-Agent": "KN-RoadLogistics-Dashboard/1.0"}
+        data    = _request_with_retry(
+            GEOCODE_URL,
+            params={"lat": lat, "lon": lng, "format": "json", "zoom": 10},
+            headers=headers,
+        )
+        addr = data.get("address", {})
+        # Priority: town > village > city > municipality > county
+        name = (
+            addr.get("town")
+            or addr.get("village")
+            or addr.get("city")
+            or addr.get("municipality")
+            or addr.get("county")
+            or addr.get("state")
+            or "Unknown"
+        )
+        time.sleep(1.1)   # Nominatim rate limit
+        return name
+    except Exception as e:
+        logger.warning(f"Reverse geocode failed for ({lat}, {lng}): {e}")
+        return "Unknown"
+
+
+# ── Weather fetching ──────────────────────────────────────────────────────────
 def _fetch_weather_at_coord(lat: float, lng: float) -> dict:
-    """Fetches current weather at any coordinate."""
+    """
+    Fetches current weather AND hourly forecast at a coordinate.
+    Returns a dict with 'current' and 'forecast' keys.
+
+    Forecast structure: {6: {...weather fields...}, 12: {...}, 24: {...}}
+    Each weather dict is compatible with HubWeather schema.
+    """
     params = {
         "latitude":        lat,
         "longitude":       lng,
@@ -239,12 +140,20 @@ def _fetch_weather_at_coord(lat: float, lng: float) -> dict:
             "temperature_2m", "wind_speed_10m", "precipitation",
             "visibility", "weather_code", "wind_gusts_10m", "snowfall",
         ],
+        "hourly":          [
+            "temperature_2m", "wind_speed_10m", "precipitation",
+            "visibility", "weather_code", "wind_gusts_10m", "snowfall",
+        ],
         "wind_speed_unit": "kmh",
         "timezone":        "Europe/Berlin",
+        "forecast_days":   2,
     }
     data    = _request_with_retry(WEATHER_BASE_URL, params=params)
     current = data.get("current", {})
-    return {
+    hourly  = data.get("hourly", {})
+
+    # Current weather
+    current_weather = {
         "hub_id":         f"{lat},{lng}",
         "temp_c":         current.get("temperature_2m"),
         "wind_kmh":       current.get("wind_speed_10m"),
@@ -255,49 +164,124 @@ def _fetch_weather_at_coord(lat: float, lng: float) -> dict:
         "weather_code":   current.get("weather_code"),
     }
 
+    # Hourly forecast slices — index 6 = +6h from now, etc.
+    # Open-Meteo returns hourly arrays starting from current hour
+    forecast = {}
+    for h in FORECAST_HOURS:
+        idx = h  # index h = h hours from now
+        try:
+            forecast[h] = {
+                "hub_id":         f"{lat},{lng}",
+                "temp_c":         hourly.get("temperature_2m", [])[idx],
+                "wind_kmh":       hourly.get("wind_speed_10m", [])[idx],
+                "wind_gusts_kmh": hourly.get("wind_gusts_10m", [])[idx],
+                "precipitation":  hourly.get("precipitation", [])[idx],
+                "snowfall":       hourly.get("snowfall", [])[idx],
+                "visibility_m":   hourly.get("visibility", [])[idx],
+                "weather_code":   hourly.get("weather_code", [])[idx],
+            }
+        except (IndexError, TypeError):
+            forecast[h] = None
+
+    return {"current": current_weather, "forecast": forecast}
+
 
 def fetch_weather_for_hub(hub: dict) -> dict:
-    """Fetches current weather for a named logistics hub."""
     raw = _fetch_weather_at_coord(hub["lat"], hub["lng"])
-    raw["hub_id"] = hub["id"]
+    raw["current"]["hub_id"] = hub["id"]
     return raw
 
 
 def fetch_all_hub_weather() -> dict:
-    """Fetches weather for all logistics hubs. Returns dict keyed by hub_id."""
+    """Returns dict keyed by hub_id, each value has 'current' and 'forecast'."""
     weather_map = {}
     for hub in LOGISTICS_HUBS:
         try:
             weather_map[hub["id"]] = fetch_weather_for_hub(hub)
-            logger.info(f"  Hub weather fetched: {hub['name']}")
+            logger.info(f"  Hub weather + forecast fetched: {hub['name']}")
         except Exception as e:
             logger.error(f"Failed for hub {hub['id']}: {e}")
             weather_map[hub["id"]] = None
     return weather_map
 
 
+# ── Waypoint generation ───────────────────────────────────────────────────────
+def _interpolate_waypoints(o_lat, o_lng, d_lat, d_lng, n):
+    return [
+        {
+            "lat": round(o_lat + (d_lat - o_lat) * i / (n + 1), 4),
+            "lng": round(o_lng + (d_lng - o_lng) * i / (n + 1), 4),
+        }
+        for i in range(1, n + 1)
+    ]
+
+
+def _n_interval_waypoints(distance_km: int) -> int:
+    if distance_km < 400:  return 2
+    if distance_km < 700:  return 3
+    if distance_km < 1200: return 5
+    return 7
+
+
+def get_corridor_waypoints(corridor: dict) -> list[dict]:
+    hub_lookup  = {h["id"]: h for h in LOGISTICS_HUBS}
+    origin      = hub_lookup[corridor["origin"]]
+    destination = hub_lookup[corridor["destination"]]
+    n_points    = _n_interval_waypoints(corridor["distance_km"])
+
+    interval_coords = _interpolate_waypoints(
+        origin["lat"], origin["lng"],
+        destination["lat"], destination["lng"],
+        n_points,
+    )
+
+    waypoints = []
+    for i, pt in enumerate(interval_coords):
+        # Reverse geocode to get town name
+        town = reverse_geocode(pt["lat"], pt["lng"])
+        waypoints.append({
+            **pt,
+            "type":      "interval",
+            "wp_number": i + 1,
+            "name":      f"WP{i+1} — {town}",
+            "town":      town,
+            "risk_note": None,
+        })
+
+    for area in HIGH_RISK_AREAS:
+        if corridor["id"] in area["applies_to"]:
+            waypoints.append({
+                "lat":       area["lat"],
+                "lng":       area["lng"],
+                "type":      "high_risk",
+                "wp_number": None,
+                "name":      area["name"],
+                "town":      area["name"],
+                "risk_note": area["risk_note"],
+            })
+
+    return waypoints
+
+
 def fetch_waypoint_weather(corridor: dict) -> list[dict]:
     """
-    Fetches weather for all waypoints along a corridor.
-    Returns list of waypoint dicts enriched with weather data.
+    Fetches current + forecast weather for all waypoints along a corridor.
+    Each result has 'weather' (current) and 'forecast' ({6: ..., 12: ..., 24: ...}).
     """
     waypoints = get_corridor_waypoints(corridor)
     results   = []
-
     for wp in waypoints:
         try:
-            weather = _fetch_weather_at_coord(wp["lat"], wp["lng"])
-            results.append({**wp, "weather": weather})
-            logger.info(f"    ✓ {wp['name']} ({wp['lat']:.2f}, {wp['lng']:.2f})")
+            data = _fetch_weather_at_coord(wp["lat"], wp["lng"])
+            results.append({**wp, "weather": data["current"], "forecast": data["forecast"]})
+            logger.info(f"    {wp['name']} ({wp['lat']:.2f}, {wp['lng']:.2f})")
         except Exception as e:
-            logger.warning(f"    ✗ Failed waypoint {wp['name']}: {e}")
-            results.append({**wp, "weather": None})
-
+            logger.warning(f"    Failed: {wp['name']}: {e}")
+            results.append({**wp, "weather": None, "forecast": {}})
     return results
 
 
 def fetch_country_data(country_codes: list[str]) -> dict:
-    """Fetches country metadata. Returns dict keyed by 2-letter code."""
     url    = f"{COUNTRIES_BASE_URL}/alpha"
     params = {"codes": ",".join(country_codes)}
     try:
