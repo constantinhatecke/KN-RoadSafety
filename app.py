@@ -19,10 +19,9 @@ import sys, os
 sys.path.insert(0, os.path.dirname(__file__))
 
 from src.api.client import (
-    fetch_all_hub_weather, fetch_waypoint_weather,
+    fetch_all_hub_weather, fetch_all_waypoints_parallel,
     fetch_country_data, LOGISTICS_HUBS, ROAD_CORRIDORS,
 )
-from src.parsers.validator import validate_hub_weather, HubWeather
 from src.transformers.transform import assess_corridor_risk, build_summary
 
 # ── Brand colours ─────────────────────────────────────────────────────────────
@@ -164,18 +163,21 @@ def tl_cell(risk: str) -> str:
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=0, show_spinner=False)
 def run_pipeline():
+    # All three fetches run as fast as possible:
+    # 1. Hubs: 12 parallel requests
+    # 2. Waypoints: all corridors × all waypoints in one parallel pool
+    # 3. Countries: single request
     raw_weather   = fetch_all_hub_weather()
     country_codes = list(set(h["country"] for h in LOGISTICS_HUBS))
     country_data  = fetch_country_data(country_codes)
-    corridor_wps  = {c["id"]: fetch_waypoint_weather(c) for c in ROAD_CORRIDORS}
+    corridor_wps  = fetch_all_waypoints_parallel(ROAD_CORRIDORS)
     corridors     = [
         assess_corridor_risk(c, raw_weather, corridor_wps.get(c["id"], []), country_data)
         for c in ROAD_CORRIDORS
     ]
-    summary    = build_summary(corridors, raw_weather)
-    risk_order = {"high": 0, "medium": 1, "low": 2}
+    summary = build_summary(corridors, raw_weather)
     return {
-        "corridors":   sorted(corridors, key=lambda c: (
+        "corridors": sorted(corridors, key=lambda c: (
             0 if c["risk_level"] == "high"
             else 1 if c.get("deteriorating")
             else 2 if c["risk_level"] == "medium"
@@ -252,7 +254,7 @@ with col_title:
     st.markdown(f"""
     <div class="kn-header">
       <div class="kn-logo">KUEHNE<span class="kn-logo-plus">+</span>NAGEL</div>
-      <div class="kn-subtitle">Road Logistics &nbsp;·&nbsp; Weather Risk Dashboard &nbsp;·&nbsp; European Network &nbsp;·&nbsp; 24h Forecast</div>
+      <div class="kn-subtitle">Road Logistics &nbsp;·&nbsp; Weather Risk Dashboard &nbsp;·&nbsp; European Network &nbsp;·&nbsp; +6h / +12h / +24h Forecast</div>
     </div>""", unsafe_allow_html=True)
 with col_btn:
     st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
@@ -299,7 +301,7 @@ if st.session_state.last_fetched:
     st.markdown(
         f'<div class="kn-ts">Live data &nbsp;·&nbsp; Refreshed: '
         f'<strong style="color:{KN_WHITE}">{st.session_state.last_fetched}</strong>'
-        f'&nbsp;&nbsp;·&nbsp;&nbsp;{total_wp} waypoints assessed &nbsp;·&nbsp; 24h forecast active</div>',
+        f'&nbsp;&nbsp;·&nbsp;&nbsp;{total_wp} waypoints assessed &nbsp;·&nbsp; +6h / +12h / +24h forecast active</div>',
         unsafe_allow_html=True
     )
 
@@ -315,7 +317,7 @@ if high_count > 0:
     st.markdown(f'<div class="kn-alert-high">HIGH RISK &nbsp;·&nbsp; {high_count} corridor{"s" if high_count>1 else ""} require immediate attention{d_str}{hr_str}</div>', unsafe_allow_html=True)
 
 if det_count > 0:
-    st.markdown(f'<div class="kn-alert-det">FORECAST WARNING &nbsp;·&nbsp; {det_count} corridor{"s" if det_count>1 else ""} currently clear but conditions will deteriorate within 24h &nbsp;·&nbsp; Brief drivers before departure</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kn-alert-det">FORECAST WARNING &nbsp;·&nbsp; {det_count} corridor{"s" if det_count>1 else ""} currently acceptable but conditions will deteriorate within 24h &nbsp;·&nbsp; Brief drivers before departure</div>', unsafe_allow_html=True)
 
 # KPIs
 def kpi(col, label, value, sub, css_class):
@@ -541,9 +543,13 @@ with right:
             if timeline:
                 st.markdown(
                     f'<div style="margin-top:12px;font-size:10px;font-weight:700;color:{KN_DIM};'
-                    f'text-transform:uppercase;letter-spacing:1.5px;margin-bottom:6px;">24h Risk Forecast</div>',
+                    f'text-transform:uppercase;letter-spacing:1.5px;margin-bottom:6px;">Risk Forecast</div>',
                     unsafe_allow_html=True
                 )
+                now   = timeline.get("now",   "low")
+                h6    = timeline.get("+6h",   "low")
+                h12   = timeline.get("+12h",  "low")
+                h24   = timeline.get("+24h",  "low")
                 st.markdown(f"""
                 <table class="timeline-table">
                   <tr>
@@ -553,10 +559,10 @@ with right:
                     <th>+24h</th>
                   </tr>
                   <tr>
-                    <td class="tl-now {f"tl-{timeline.get('now','low')}"}">{timeline.get('now','?').upper()}</td>
-                    {tl_cell(timeline.get('+6h','low'))}
-                    {tl_cell(timeline.get('+12h','low'))}
-                    {tl_cell(timeline.get('+24h','low'))}
+                    <td class="tl-now tl-{now}">{now.upper()}</td>
+                    {tl_cell(h6)}
+                    {tl_cell(h12)}
+                    {tl_cell(h24)}
                   </tr>
                 </table>
                 """, unsafe_allow_html=True)
@@ -631,7 +637,7 @@ if hub_temps:
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.markdown(f"""
 <div class="kn-footer">
-  <span>Data: Open-Meteo (live + 24h forecast) &nbsp;·&nbsp; REST Countries &nbsp;·&nbsp; Nominatim (geocoding)</span>
-  <span>Kuehne+Nagel &nbsp;·&nbsp; Road Logistics &nbsp;·&nbsp; Operational Excellence &nbsp;·&nbsp; v5</span>
+  <span>Data: Open-Meteo (live + 24h forecast) &nbsp;·&nbsp; REST Countries</span>
+  <span>Kuehne+Nagel &nbsp;·&nbsp; Road Logistics &nbsp;·&nbsp; Operational Excellence</span>
 </div>
 """, unsafe_allow_html=True)
