@@ -571,7 +571,7 @@ with right:
             else "MEDIUM"   if risk == "medium"
             else "CLEAR"
         )
-        expanded = risk == "high" or deteriorating
+        expanded = risk == "high"
 
         with st.expander(
             f"{c['origin']['city']} to {c['destination']['city']}  —  {c['distance_km']:,} km  [{risk_label}]",
@@ -649,31 +649,26 @@ with right:
                 f'{c["recommendation"]}</div>', unsafe_allow_html=True
             )
 
-            # Point-by-point breakdown
+            # Point-by-point breakdown — collapsed by default to save space
             all_pts = c.get("all_points", [])
             if all_pts:
-                st.markdown(
-                    f'<div style="margin-top:12px;font-size:10px;font-weight:700;color:{KN_DIM};'
-                    f'text-transform:uppercase;letter-spacing:1.5px;padding-bottom:6px;'
-                    f'border-bottom:1px solid {KN_BORDER};">Point-by-point assessment</div>',
-                    unsafe_allow_html=True
-                )
-                for pt in all_pts:
-                    pt_risk   = pt["risk_level"]
-                    tag_class = ("wp-tag-hr" if pt["type"]=="high_risk" else "wp-tag-iv" if pt["type"]=="interval" else "wp-tag-ep")
-                    tag_label = ("High-Risk Area" if pt["type"]=="high_risk" else "Interval" if pt["type"]=="interval" else "Hub")
-                    w         = pt.get("weather", {})
-                    temp_str  = f"{w.get('temp_c','?')}°C" if w.get("available") else "N/A"
-                    wind_str  = f"{w.get('wind_kmh','?')} km/h" if w.get("available") else ""
-                    st.markdown(
-                        f'<div class="wp-row">'
-                        f'<span class="wp-tag {tag_class}">{tag_label}</span>'
-                        f'<span class="wp-name">{pt["name"]}</span>'
-                        f'<span class="wp-risk-{pt_risk}">{pt_risk.upper()}</span>'
-                        f'<span style="color:{KN_DIM};font-size:11px;margin-left:auto;">'
-                        f'{temp_str} &nbsp; {wind_str}</span>'
-                        f'</div>', unsafe_allow_html=True
-                    )
+                with st.expander(f"Point-by-point assessment ({len(all_pts)} points)", expanded=False):
+                    for pt in all_pts:
+                        pt_risk   = pt["risk_level"]
+                        tag_class = ("wp-tag-hr" if pt["type"]=="high_risk" else "wp-tag-iv" if pt["type"]=="interval" else "wp-tag-ep")
+                        tag_label = ("High-Risk Area" if pt["type"]=="high_risk" else "Interval" if pt["type"]=="interval" else "Hub")
+                        w         = pt.get("weather", {})
+                        temp_str  = f"{w.get('temp_c','?')}°C" if w.get("available") else "N/A"
+                        wind_str  = f"{w.get('wind_kmh','?')} km/h" if w.get("available") else ""
+                        st.markdown(
+                            f'<div class="wp-row">'
+                            f'<span class="wp-tag {tag_class}">{tag_label}</span>'
+                            f'<span class="wp-name">{pt["name"]}</span>'
+                            f'<span class="wp-risk-{pt_risk}">{pt_risk.upper()}</span>'
+                            f'<span style="color:{KN_DIM};font-size:11px;margin-left:auto;">'
+                            f'{temp_str} &nbsp; {wind_str}</span>'
+                            f'</div>', unsafe_allow_html=True
+                        )
 
 
 # ── Hub temperatures ──────────────────────────────────────────────────────────
