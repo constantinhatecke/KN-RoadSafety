@@ -110,14 +110,22 @@ st.markdown(f"""
   /* Expanders */
   [data-testid="stExpander"] {{ background: {KN_CARD} !important; border: 1px solid {KN_BORDER} !important; border-radius: 0 !important; margin-bottom: 4px !important; }}
   [data-testid="stExpander"]:hover {{ border-color: {KN_BLUE} !important; }}
+  [data-testid="stExpander"] summary {{ background: {KN_CARD} !important; }}
+  [data-testid="stExpander"] summary:hover {{ background: #1a3660 !important; }}
   [data-testid="stExpander"] summary p,
-  [data-testid="stExpander"] summary span {{ color: {KN_WHITE} !important; font-weight: 600 !important; font-size: 13px !important; }}
+  [data-testid="stExpander"] summary span,
+  [data-testid="stExpander"] summary div {{ color: {KN_WHITE} !important; font-weight: 600 !important; font-size: 13px !important; background: transparent !important; }}
   [data-testid="stExpanderDetails"] {{ background: #0F2040 !important; border-top: 1px solid {KN_BORDER} !important; padding: 12px 14px !important; }}
   [data-testid="stExpanderDetails"] p,
   [data-testid="stExpanderDetails"] span,
   [data-testid="stExpanderDetails"] label {{ color: {KN_LIGHT} !important; font-size: 13px !important; }}
   [data-testid="stExpanderDetails"] strong {{ color: {KN_WHITE} !important; }}
   [data-testid="stExpanderDetails"] code {{ background: {KN_BORDER} !important; color: #88CCEE !important; }}
+  /* Risk-colored left border on expanders */
+  .expander-high   {{ border-left: 4px solid {RISK_HIGH} !important; }}
+  .expander-medium {{ border-left: 4px solid {RISK_MED}  !important; }}
+  .expander-det    {{ border-left: 4px solid {RISK_DET}  !important; }}
+  .expander-low    {{ border-left: 4px solid {RISK_LOW}  !important; }}
 
   /* Deterioration callout */
   .det-box {{ background: rgba(255,140,66,0.08); border: 1px solid rgba(255,140,66,0.3); border-left: 3px solid {RISK_DET}; padding: 9px 12px; margin: 8px 0; font-size: 13px; color: #FFCCA0 !important; }}
@@ -416,15 +424,57 @@ with left:
                 text=hr_texts, hovertemplate="%{text}<extra></extra>", showlegend=False,
             ))
 
-    # Hub markers
+    # Hub markers — with full weather data in hover tooltip
+    hub_lats, hub_lngs, hub_names, hub_texts, hub_colors = [], [], [], [], []
+    for h in LOGISTICS_HUBS:
+        # Find current weather for this hub from any corridor that uses it
+        hub_weather = None
+        for c in corridors:
+            if c["origin"]["hub_id"] == h["id"]:
+                hub_weather = c["weather"]["origin"]
+                break
+            if c["destination"]["hub_id"] == h["id"]:
+                hub_weather = c["weather"]["destination"]
+                break
+
+        hub_lats.append(h["lat"])
+        hub_lngs.append(h["lng"])
+        hub_names.append(h["name"])
+
+        if hub_weather and hub_weather.get("available"):
+            w = hub_weather
+            risk = w.get("risk_level", "low")
+            hub_colors.append(COLOR_MAP.get(risk, KN_BLUE))
+            temp  = f"{w.get('temp_c','?')}°C"
+            wind  = f"{w.get('wind_kmh','?')} km/h"
+            gusts = f"{w.get('wind_gusts_kmh','?')} km/h"
+            vis_m = w.get("visibility_m")
+            vis   = f"{round(vis_m/1000,1)} km" if vis_m is not None else "N/A"
+            precip = f"{w.get('precipitation','?')} mm"
+            snow  = f"{w.get('snowfall','?')} cm/h" if w.get("snowfall") else "None"
+            cond  = w.get("condition","").replace("_"," ").title()
+            hub_texts.append(
+                f"<b>Hub: {h['name']}</b><br>"
+                f"Risk: {risk.upper()}<br>"
+                f"Condition: {cond}<br>"
+                f"Temp: {temp} &nbsp; Wind: {wind} (gusts {gusts})<br>"
+                f"Visibility: {vis} &nbsp; Precip: {precip}<br>"
+                f"Snowfall: {snow}"
+            )
+        else:
+            hub_colors.append(KN_BLUE)
+            hub_texts.append(f"<b>Hub: {h['name']}</b><br>Weather data unavailable")
+
     fig.add_trace(go.Scattergeo(
-        lon=[h["lng"] for h in LOGISTICS_HUBS],
-        lat=[h["lat"] for h in LOGISTICS_HUBS],
+        lon=hub_lngs, lat=hub_lats,
         mode="markers" + ("+text" if show_hub_labels else ""),
-        marker=dict(size=9, color=KN_BLUE, symbol="circle", line=dict(width=1.5, color=KN_WHITE)),
-        text=[h["name"] for h in LOGISTICS_HUBS] if show_hub_labels else [],
+        marker=dict(size=10, color=hub_colors, symbol="circle",
+                    line=dict(width=2, color=KN_WHITE)),
+        text=hub_names if show_hub_labels else [],
+        customdata=hub_texts,
         textposition="top center", textfont=dict(size=11, color=KN_WHITE),
-        hovertemplate="<b>%{text}</b><extra></extra>", showlegend=False,
+        hovertemplate="%{customdata}<extra></extra>",
+        showlegend=False,
     ))
 
     fig.update_layout(
@@ -474,6 +524,25 @@ with left:
 
 # ── Corridor cards ────────────────────────────────────────────────────────────
 with right:
+    # Inject JS to apply risk-colored left borders to expanders
+    # Streamlit doesn't allow direct CSS targeting by dynamic content,
+    # so we use a small script to walk the DOM after render
+    border_rules = []
+    for i, c in enumerate(filtered):
+        risk = c["risk_level"]
+        det  = c.get("deteriorating", False)
+        color = (
+            RISK_HIGH if risk == "high"
+            else RISK_DET  if det
+            else RISK_MED  if risk == "medium"
+            else RISK_LOW
+        )
+        border_rules.append(f"document.querySelectorAll('[data-testid=\"stExpander\"]')[{i}]?.style.setProperty('border-left', '4px solid {color}', 'important');")
+
+    if border_rules:
+        js = "\n".join(border_rules)
+        st.markdown(f"<script>{js}</script>", unsafe_allow_html=True)
+
     label_sfx = f" — {risk_filter}" if active_filter else ""
     st.markdown(f'<div class="kn-section">Corridors{label_sfx} ({len(filtered)} shown)</div>', unsafe_allow_html=True)
 
@@ -489,17 +558,23 @@ with right:
         worst        = c.get("worst_point")
         timeline     = c.get("timeline", {})
 
-        # Expander label — no emojis, use text prefix
-        risk_prefix = (
-            "[HIGH]"   if risk == "high"
-            else "[WARN]" if deteriorating
-            else "[MED]"  if risk == "medium"
-            else "[OK]"
+        # Expander label with colored risk indicator dot
+        dot_color = (
+            RISK_HIGH if risk == "high"
+            else RISK_DET  if deteriorating
+            else RISK_MED  if risk == "medium"
+            else RISK_LOW
+        )
+        risk_label = (
+            "HIGH RISK" if risk == "high"
+            else "WARNING"  if deteriorating
+            else "MEDIUM"   if risk == "medium"
+            else "CLEAR"
         )
         expanded = risk == "high" or deteriorating
 
         with st.expander(
-            f"{risk_prefix}  {c['origin']['city']} to {c['destination']['city']}  —  {c['distance_km']:,} km",
+            f"{c['origin']['city']} to {c['destination']['city']}  —  {c['distance_km']:,} km  [{risk_label}]",
             expanded=expanded
         ):
             r1, r2 = st.columns(2)

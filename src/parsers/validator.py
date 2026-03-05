@@ -40,18 +40,32 @@ HIGH_RISK_CONDITIONS = {75, 77, 85, 86, 95, 96, 99, 48}
 MEDIUM_RISK_CONDITIONS = {45, 63, 65, 71, 73, 80, 81, 82}
 
 
-# ── Risk Thresholds ───────────────────────────────────────────────────────────
+# ── Risk Thresholds — calibrated for heavy road transport (HGV/TIR) ──────────
+# HIGH   = do not operate heavy transport / route closure likely
+# MEDIUM = drivers warned, proceed with caution and reduced speed
+#
+# Raised significantly from defaults — previous thresholds were triggering
+# on normal autumn/winter driving conditions.
 THRESHOLDS = {
-    "temp_freeze":        0.0,    # °C — black ice risk below this
-    "temp_severe_freeze": -10.0,  # °C — severe icing, chains required
-    "wind_high":          60.0,   # km/h — trucks face stability issues
-    "wind_severe":        80.0,   # km/h — route closure recommended
-    "precip_medium":      5.0,    # mm — reduced visibility/traction
-    "precip_high":        10.0,   # mm — significant disruption
-    "snowfall_medium":    2.0,    # cm — snow chains may be required
-    "snowfall_high":      5.0,    # cm — route closure likely
-    "visibility_low":     1000,   # m — reduced speed mandatory
-    "visibility_severe":  200,    # m — route closure recommended
+    # Temperature — road surface freeze (air temp lags road temp by ~3°C)
+    "temp_freeze":        -3.0,   # °C — road surface icing likely
+    "temp_severe_freeze": -15.0,  # °C — widespread black ice, chains mandatory
+
+    # Wind — HGVs and curtainsiders are highly susceptible to crosswinds
+    "wind_high":           70.0,  # km/h — HGV stability warnings
+    "wind_severe":         90.0,  # km/h — route closure for high-sided vehicles
+
+    # Precipitation rate (mm/h)
+    "precip_medium":        8.0,  # mm/h — moderate traction/visibility impact
+    "precip_high":         20.0,  # mm/h — aquaplaning risk, severe visibility loss
+
+    # Snowfall accumulation rate (cm/h)
+    "snowfall_medium":      3.0,  # cm/h — snow chains advisory
+    "snowfall_high":        8.0,  # cm/h — route closure likely
+
+    # Forward visibility for large vehicles
+    "visibility_low":     500,    # m — mandatory speed reduction
+    "visibility_severe":  100,    # m — do not operate
 }
 
 
